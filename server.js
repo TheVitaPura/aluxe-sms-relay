@@ -44,7 +44,7 @@ const claude = new Anthropic({ apiKey: ANTHROPIC_KEY });
 // ── OpenPhone API helper ──────────────────────────────────────────────────────
 function sendSMS(to, content) {
   return new Promise((resolve, reject) => {
-    const body = JSON.stringify({ from: QUO_NUMBER, to, content });
+    const body = JSON.stringify({ from: QUO_NUMBER, to: [to], content });
     const req = https.request(
       {
         hostname: "api.openphone.com",
