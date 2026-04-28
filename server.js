@@ -2,22 +2,23 @@ const express = require("express");
 const Anthropic = require("@anthropic-ai/sdk");
 const fs = require("fs");
 const https = require("https");
+const { Pool } = require("pg");
 
 const app = express();
 app.use(express.json());
 
 // ── Config ────────────────────────────────────────────────────────────────────
-const PORT            = process.env.PORT || 3000;
-const OPENPHONE_KEY   = process.env.OPENPHONE_API_KEY;
-const ANTHROPIC_KEY   = process.env.ANTHROPIC_API_KEY;
-const QUO_NUMBER      = process.env.QUO_PHONE_NUMBER;   // "+16234002146"
-const KEVIN_PERSONAL  = process.env.KEVIN_PERSONAL_PHONE; // "+18324543136" (or current personal)
-const WEBHOOK_SECRET  = process.env.WEBHOOK_SECRET || "";
+const PORT           = process.env.PORT || 3000;
+const OPENPHONE_KEY  = process.env.OPENPHONE_API_KEY;
+const ANTHROPIC_KEY  = process.env.ANTHROPIC_API_KEY;
+const QUO_NUMBER     = process.env.QUO_PHONE_NUMBER;    // "+16234002146"
+const KEVIN_PERSONAL = process.env.KEVIN_PERSONAL_PHONE;
+const DATABASE_URL   = process.env.DATABASE_URL;
 
-// ── Brain v6 system prompt ────────────────────────────────────────────────────
-const BRAIN_V6 = fs.readFileSync(`${__dirname}/brain-v6.txt`, "utf8");
+// ── Brain v7 system prompt ────────────────────────────────────────────────────
+const BRAIN_V7 = fs.readFileSync(`${__dirname}/brain-v7.txt`, "utf8");
 
-const SYSTEM_PROMPT = `${BRAIN_V6}
+const SYSTEM_PROMPT = `${BRAIN_V7}
 
 ---
 CHANNEL CONTEXT: You are responding via SMS text message. Keep all replies SHORT — 2 to 4 sentences max. SMS is not Instagram DM. No walls of text. Get to the point fast. Still sound like Kevin.
@@ -25,7 +26,7 @@ CHANNEL CONTEXT: You are responding via SMS text message. Keep all replies SHORT
 IMPORTANT: Do NOT include any preamble, asterisks, markdown, or labels like "Response:". Just the text Kevin would actually send.
 `;
 
-const REFERRAL_SYSTEM = `${BRAIN_V6}
+const REFERRAL_SYSTEM = `${BRAIN_V7}
 
 ---
 TASK: Kevin just sent you a referral. Write the FIRST text message Kevin would send to this new lead.
@@ -33,10 +34,58 @@ Rules: 2-3 sentences max. Warm, direct, no pressure. Reference what Kevin heard 
 Output ONLY the text message. No labels, no markdown.
 `;
 
-// ── State ─────────────────────────────────────────────────────────────────────
-// Conversation history: Map<fromPhone, { messages: [], lastActivity: Date }>
-const conversations = new Map();
-// Dedup: Set of processed message IDs
+// ── PostgreSQL setup (persistent conversation history) ────────────────────────
+let pool = null;
+
+async function initDB() {
+  if (!DATABASE_URL) {
+    console.log("No DATABASE_URL — using in-memory conversation store.");
+    return;
+  }
+  pool = new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } });
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS sms_conversations (
+      phone       TEXT PRIMARY KEY,
+      messages    JSONB NOT NULL DEFAULT '[]',
+      updated_at  TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+  console.log("PostgreSQL connected — conversation history is persistent.");
+}
+
+// ── In-memory fallback (used when no DATABASE_URL) ────────────────────────────
+const memStore = new Map();
+
+// ── Conversation helpers ──────────────────────────────────────────────────────
+async function getMessages(phone) {
+  if (pool) {
+    const { rows } = await pool.query(
+      "SELECT messages FROM sms_conversations WHERE phone = $1",
+      [phone]
+    );
+    return rows.length ? rows[0].messages : [];
+  }
+  return memStore.get(phone) || [];
+}
+
+async function saveMessages(phone, messages) {
+  // Cap at 20 to control token usage
+  const capped = messages.slice(-20);
+  if (pool) {
+    await pool.query(
+      `INSERT INTO sms_conversations (phone, messages, updated_at)
+       VALUES ($1, $2, NOW())
+       ON CONFLICT (phone) DO UPDATE
+         SET messages = $2, updated_at = NOW()`,
+      [phone, JSON.stringify(capped)]
+    );
+  } else {
+    memStore.set(phone, capped);
+  }
+  return capped;
+}
+
+// ── Dedup set ─────────────────────────────────────────────────────────────────
 const processedIds = new Set();
 
 const claude = new Anthropic({ apiKey: ANTHROPIC_KEY });
@@ -85,27 +134,7 @@ async function askClaude(systemPrompt, messages) {
   return response.content[0].text.trim();
 }
 
-// ── Conversation helpers ──────────────────────────────────────────────────────
-function getConversation(phone) {
-  if (!conversations.has(phone)) {
-    conversations.set(phone, { messages: [], lastActivity: new Date() });
-  }
-  const conv = conversations.get(phone);
-  conv.lastActivity = new Date();
-  return conv;
-}
-
-function addToConversation(phone, role, content) {
-  const conv = getConversation(phone);
-  conv.messages.push({ role, content });
-  // Cap history at 20 messages to save tokens
-  if (conv.messages.length > 20) {
-    conv.messages = conv.messages.slice(-20);
-  }
-}
-
 // ── Referral parser ───────────────────────────────────────────────────────────
-// Kevin texts: "Referral: Sarah Johnson, +16025551234, interested in Botox for her 11s"
 function parseReferral(body) {
   const stripped = body.replace(/^referral:\s*/i, "").trim();
   const parts = stripped.split(",").map((s) => s.trim());
@@ -113,7 +142,6 @@ function parseReferral(body) {
   const name    = parts[0];
   const phone   = parts[1].replace(/\s/g, "");
   const context = parts.slice(2).join(", ");
-  // Basic phone validation
   if (!/^\+?1?\d{10}$/.test(phone.replace(/\D/g, ""))) return null;
   const normalized = phone.startsWith("+") ? phone : `+1${phone.replace(/\D/g, "")}`;
   return { name, phone: normalized, context };
@@ -121,7 +149,6 @@ function parseReferral(body) {
 
 // ── Webhook route ─────────────────────────────────────────────────────────────
 app.post("/webhook", async (req, res) => {
-  // Acknowledge immediately — OpenPhone expects fast 200
   res.sendStatus(200);
 
   try {
@@ -135,18 +162,15 @@ app.post("/webhook", async (req, res) => {
     const from      = msg.from;
     const body      = (msg.body || "").trim();
 
-    // Dedup
     if (processedIds.has(messageId)) return;
     processedIds.add(messageId);
-    // Clean up old IDs after 1000 entries
     if (processedIds.size > 1000) {
-      const oldest = [...processedIds].slice(0, 200);
-      oldest.forEach((id) => processedIds.delete(id));
+      [...processedIds].slice(0, 200).forEach((id) => processedIds.delete(id));
     }
 
     console.log(`[IN] ${from}: ${body}`);
 
-    // ── Referral trigger (Kevin texting his own number) ─────────────────────
+    // ── Referral trigger ────────────────────────────────────────────────────
     const isKevin    = KEVIN_PERSONAL && from === KEVIN_PERSONAL;
     const isReferral = isKevin && /^referral:/i.test(body);
 
@@ -163,22 +187,21 @@ app.post("/webhook", async (req, res) => {
         },
       ]);
       await sendSMS(ref.phone, intro);
-      console.log(`[REFERRAL] Sent intro to ${ref.phone}: ${intro}`);
-      // Confirm to Kevin
       await sendSMS(from, `Sent to ${ref.name} (${ref.phone}): "${intro}"`);
+      console.log(`[REFERRAL] Sent intro to ${ref.phone}: ${intro}`);
       return;
     }
 
-    // ── Skip Kevin texting himself (non-referral) ───────────────────────────
     if (isKevin) return;
 
-    // ── Normal inbound — run Brain v6 ──────────────────────────────────────
-    addToConversation(from, "user", body);
-    const conv = getConversation(from);
+    // ── Normal inbound — load history, call Claude, save ───────────────────
+    const history = await getMessages(from);
+    history.push({ role: "user", content: body });
 
-    const reply = await askClaude(SYSTEM_PROMPT, conv.messages);
-    addToConversation(from, "assistant", reply);
+    const reply = await askClaude(SYSTEM_PROMPT, history);
+    history.push({ role: "assistant", content: reply });
 
+    await saveMessages(from, history);
     await sendSMS(from, reply);
     console.log(`[OUT] ${from}: ${reply}`);
   } catch (err) {
@@ -187,12 +210,17 @@ app.post("/webhook", async (req, res) => {
 });
 
 // ── Health check ──────────────────────────────────────────────────────────────
-app.get("/health", (_req, res) => res.json({ status: "ok", ts: new Date().toISOString() }));
+app.get("/health", (_req, res) => res.json({ status: "ok", ts: new Date().toISOString(), db: !!pool }));
 
 // ── Startup ───────────────────────────────────────────────────────────────────
-app.listen(PORT, () => {
-  console.log(`ALUXÉ SMS Relay running on port ${PORT}`);
-  if (!OPENPHONE_KEY || !ANTHROPIC_KEY || !QUO_NUMBER) {
-    console.warn("WARNING: Missing env vars. Check .env configuration.");
-  }
+initDB().then(() => {
+  app.listen(PORT, () => {
+    console.log(`ALUXÉ SMS Relay v2 running on port ${PORT}`);
+    if (!OPENPHONE_KEY || !ANTHROPIC_KEY || !QUO_NUMBER) {
+      console.warn("WARNING: Missing env vars. Check Railway environment variables.");
+    }
+  });
+}).catch((err) => {
+  console.error("DB init failed:", err.message);
+  process.exit(1);
 });
